@@ -79,7 +79,7 @@ private:
   std::mutex mutex_;
 
 public:
-  BuddySystemManager(size_t max_size = 1024 * 1024 * 256) // Default 256MB
+  BuddySystemManager(size_t max_size = 1024 * 1024 * 1024) // Default 1GB
     : max_block_size_(max_size) {
     // Initialize free list, maximum support up to max_block_size
     size_t max_index = c10::llvm::Log2_64_Ceil(max_block_size_);
@@ -394,7 +394,7 @@ struct CachingHostAllocatorImpl {
   // Add Buddy System Manager.
   std::unique_ptr<BuddySystemManager> buddy_system_;
   bool buddy_initialized_{false};
-  size_t buddy_pool_size_{1024 * 1024 * 256}; 
+  size_t buddy_pool_size_{1024 * 1024 * 1024}; 
 
   virtual ~CachingHostAllocatorImpl() {
     active_ = false;
