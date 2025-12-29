@@ -1,22 +1,18 @@
-#pragma once
-
 #include <c10/core/Allocator.h>
-#include <c10/core/AllocatorConfig.h>
-#include <c10/core/Stream.h>
 #include <c10/core/thread_pool.h>
+#include <c10/util/CallOnce.h>
 #include <c10/util/flat_hash_map.h>
 #include <c10/util/llvmMathExtras.h>
-#include <iostream>
 #include <optional>
 
 #include <deque>
 #include <mutex>
+#include <set>
+#include <iostream>
+#include <cstdlib> 
 
 C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wunused-parameter")
 namespace at {
-
-using c10::CachingAllocator::Stat;
-using c10::CachingAllocator::DurationStat;
 
 /**
  * HostBlock is typically a fundamental memory block used in pinned memory. It
@@ -28,18 +24,21 @@ struct HostBlock {
   // constructor for search key
   HostBlock(size_t size) : size_(size) {}
 
-  HostBlock(size_t size, void* ptr) : size_(size), ptr_(ptr) {}
+  HostBlock(size_t size, void* ptr) : size_(size), ptr_(ptr), original_ptr_(ptr) {}
 
   std::mutex mutex_;
   size_t size_{0}; // block size in bytes
   void* ptr_{nullptr}; // memory address
+  void* original_ptr_{nullptr}; // 原始分配地址（用于追踪伙伴块关系）
   bool allocated_{false}; // in-use flag
   size_t event_count_{0}; // number of related events
+  bool is_buddy_split_{false}; // 标记是否为切分块
+  size_t original_size_{0}; // 原始块大小
   ska::flat_hash_set<S> streams_; // streams on which the block was used
 };
 
 template <typename B>
-struct alignas(hardware_destructive_interference_size) FreeBlockList {
+struct alignas(64) FreeBlockList {
   std::mutex mutex_;
   std::deque<B*> list_;
 };
@@ -48,107 +47,8 @@ namespace {
   // Max cached block sizes: (1 << MAX_SIZE_INDEX) bytes
   // NOLINTNEXTLINE(misc-definitions-in-headers)
   constexpr size_t MAX_SIZE_INDEX = 64;
+  constexpr size_t MAX_INDEX = 40;
 }
-
-// A large reserved pinned memory segment that is created in advance which is used
-// to allocate small pinned memory requests to avoid calling into expensive APIs.
-// We never free this memory and move up the pointer as we allocate new blocks
-// and when blocks are freed, they are cached in the free lists.
-struct PinnedReserveSegment {
-  PinnedReserveSegment(void *start, size_t size) : start_(start), size_(size),
-    current_ptr_(start_), initialized_(true) {}
-
-  PinnedReserveSegment() : start_(nullptr), size_(0), current_ptr_(nullptr), initialized_(false) {}
-
-  bool initialized() {
-    return initialized_;
-  }
-
-  void* allocate(size_t bytes) {
-    std::lock_guard<std::mutex> guard(mutex_);
-
-    // Round up the requested size to 4KB boundary for all including the small ones.
-    size_t rounded_bytes = (bytes + 4096 - 1) & ~(4096 - 1);
-
-    if (((uint8_t*)current_ptr_ + rounded_bytes) > ((uint8_t*)start_ + size_)) {
-      return nullptr;
-    }
-
-    void* ptr = current_ptr_;
-    current_ptr_ = (uint8_t*)current_ptr_ + rounded_bytes;
-    return ptr;
-  }
-
-  bool owns(void* ptr) {
-    return ptr >= start_ && ptr < (uint8_t*)start_ + size_;
-  }
-
-  std::mutex mutex_;
-  void* start_;
-  size_t size_;
-  void* current_ptr_;
-  bool initialized_;
-};
-
-// Struct containing memory allocator summary statistics for host.
-struct TORCH_API HostStats {
-  // COUNT: total allocations (active)
-  Stat active_requests;
-  // SUM: bytes allocated/reserved by this memory allocator. (active)
-  Stat active_bytes;
-  // COUNT: total allocations (active + free)
-  Stat allocations;
-  // SUM: bytes allocated/reserved by this memory allocator. This accounts
-  // for both free and in-use blocks.
-  Stat allocated_bytes;
-
-  // SUM: time spent in cudaHostAlloc/cudaHostRegister in microseconds
-  DurationStat host_alloc_time;
-
-  // SUM: time spent in cudaHostFree/cudaHostUnregister in microseconds
-  DurationStat host_free_time;
-
-  // COUNT: number of times cudaHostAlloc/cudaHostRegister was called because
-  // the request could not be satisfied from existing free blocks.
-  int64_t num_host_alloc = 0; // This is derived from segment or timing
-
-  // COUNT: number of times cudaHostFree/cudaHostUnregister was called.
-  int64_t num_host_free = 0; // This is derived from segment or timing
-
-  // Count of cudaHostAlloc/cudaHostRegister per bucket
-  std::vector<int64_t> bucket_allocation = std::vector<int64_t>(MAX_SIZE_INDEX);
-};
-
-// Struct containing memory allocator summary statistics for host, as they
-// are staged for reporting. This is a temporary struct that is used to
-// avoid locking the allocator while collecting stats.
-struct alignas(hardware_destructive_interference_size) HostStatsStaged {
-  std::mutex timing_mutex_;
-  // COUNT: total allocations (active + free)
-  // LOCK: access to this stat is protected by the allocator's blocks_mutex_
-  Stat allocations;
-  // SUM: bytes allocated/reserved by this memory allocator. This accounts
-  // for both free and in-use blocks.
-  Stat allocated_bytes;
-  // COUNT: number of allocations per bucket (active)
-  // LOCK: access to this stat is protected by the per bucket free_list_[index].mutex_
-  std::vector<Stat> active_bucket_stats = std::vector<Stat>(MAX_SIZE_INDEX);
-  // SUM: bytes of allocation per bucket (active)
-  // LOCK: access to this stat is protected by the per bucket free_list_[index].mutex_
-  std::vector<Stat> active_bytes_bucket_stats = std::vector<Stat>(MAX_SIZE_INDEX);
-  // COUNT: number of allocations per bucket (active + free)
-  // LOCK: access to this stat is protected by the per bucket free_list_[index].mutex_
-  std::vector<Stat> allocation_bucket_stats = std::vector<Stat>(MAX_SIZE_INDEX);
-  // SUM: bytes of allocation per bucket (active + free)
-  // LOCK: access to this stat is protected by the per bucket free_list_[index].mutex_
-  std::vector<Stat> allocated_bytes_bucket_stats = std::vector<Stat>(MAX_SIZE_INDEX);
-  // SUM: time spent in cudaHostAlloc/cudaHostRegister
-  // LOCK: access to this stat is protected by the timing_mutex_
-  DurationStat host_alloc_time;
-  // SUM: time spent in cudaHostFree/cudaHostUnregister
-  // LOCK: access to this stat is protected by the timing_mutex_
-  DurationStat host_free_time;
-};
 
 /**
  * Note [HostAllocator design]
@@ -211,13 +111,6 @@ struct alignas(hardware_destructive_interference_size) HostStatsStaged {
  *
  * Note that this caching host allocator does not split larger allocations into
  * smaller blocks, unlike the caching device allocator.
- *
- * In order to gather statistics about caching host allocator while minimally
- * impacting performance, we use a HostStatsStaged struct to stage the stats
- * before reporting them. This is done to avoid adding new locks to the allocator.
- * Collecting stats is carefully done under existing locks, and then the staged
- * stats are converted to the final stats when getStats is called. At that time
- * we hold the same locks as empty_cache, to ensure the fidelity of the stats.
  */
 
 template <
@@ -225,37 +118,36 @@ template <
     typename E,
     typename B = HostBlock<S>>
 struct CachingHostAllocatorImpl {
-  virtual ~CachingHostAllocatorImpl() {
-    active_ = false;
-    if (pinned_use_background_threads()) {
-      getBackgroundThreadPool()->waitWorkComplete();
-    }
-  }
+  virtual ~CachingHostAllocatorImpl() = default;
 
  public:
-  // ==============newly added==============
-  // warm-up function
-  virtual void warmup_cache(const std::vector<size_t>& common_sizes, size_t copies_per_size = 5) {
-        for (size_t size : common_sizes) {
-            size_t roundSize = c10::llvm::PowerOf2Ceil(size);
-            
-            for (size_t i = 0; i < copies_per_size; ++i) {
-                void* ptr = nullptr;
-                allocate_host_memory(roundSize, &ptr);  // allocate memory
-                
-                B* block = new B(roundSize, ptr);
-                block->allocated_ = false;  // signed as not-allocated
-                
-                // Directly added to the corresponding size free list
-                auto index = size_index(roundSize);
-                std::lock_guard<std::mutex> g(free_list_[index].mutex_);
-                free_list_[index].list_.push_back(block);
-            }
-        }
-    }
+
+  struct PreallocInfo {
+    size_t block_count = 0;      // 预分配块数量
+    size_t block_size = 0;       // 每个块的大小（字节）
+    size_t released_count = 0;   // 已释放的块数量（需要重新申请）
+  };
+  
+  PreallocInfo prealloc_info_;
+  std::mutex prealloc_mutex_;    // 保护预分配信息的互斥锁
 
   // return data_ptr and block pair.
   virtual std::pair<void*, void*> allocate(size_t size) {
+
+    // 在函数开始时检查是否需要重新申请预分配块
+    {
+      std::lock_guard<std::mutex> g(prealloc_mutex_);
+      if (prealloc_info_.released_count > 0) {
+        // 有需要重新申请的预分配块
+        reallocate_prealloc_blocks();
+      }
+    }
+
+    static std::once_flag init_flag;
+    std::call_once(init_flag, [this] {
+      init_buddy_system();
+    });
+
     if (size == 0) {
       return {nullptr, nullptr};
     }
@@ -279,21 +171,41 @@ struct CachingHostAllocatorImpl {
     // Check in the recently freed blocks with pending events to see if we
     // can reuse them. Call get_free_block again after processing events
     if (pinned_use_background_threads()) {
+      process_events_for_specific_size(roundSize);
+      block = get_free_block(roundSize);
+      if (block) {
+        return {block->ptr_, reinterpret_cast<void*>(block)};
+      }
+
       // Launch the background thread and process events in a loop.
-      static bool background_thread_flag [[maybe_unused]] = [this] {
+      static c10::once_flag background_thread_flag;
+      c10::call_once(background_thread_flag, [this] {
         getBackgroundThreadPool()->run([&]() {
-          while (active_) {
+          while (true) {
             process_events();
             std::this_thread::sleep_for(std::chrono::microseconds(100));
           }
         });
-        return true;
-      }();
+      });
     }
 
     // Slow path: if we can't allocate from the cached free list, we need
     // to create a new block.
     void* ptr = nullptr;
+    auto expert_debug = getenv("EXPERT_DEBUG");
+    if ((expert_debug && strcmp(expert_debug, "1") == 0)) {
+      const char* min_offload_size_m = getenv("MIN_OFFLOAD_SIZE");
+      // std::cout << "EXPERT_DEBUG, MIN_OFFLOAD_SIZE: " << min_offload_size_m << std::endl;
+      int min_offload_size_b = 0;
+      if (min_offload_size_m && *min_offload_size_m != '\0') {
+          min_offload_size_b = std::stoi(min_offload_size_m) * 1024 * 1024;
+      }
+      size_t offload_threshold = c10::llvm::PowerOf2Ceil(min_offload_size_b);
+      // std::cout << "EXPERT_DEBUG, offload_threshold: " << offload_threshold << std::endl;
+      if (roundSize >= offload_threshold) {
+        std::cout << "EXPERT_DEBUG, allocate_host_memory, roundSize " << roundSize << std::endl;
+      }
+    }
     allocate_host_memory(roundSize, &ptr);
 
     // Then, create a new block.
@@ -305,6 +217,33 @@ struct CachingHostAllocatorImpl {
   }
 
   virtual void free(void* ctx) {
+/*
+static std::chrono::steady_clock::time_point last_output_time;
+  static std::mutex output_mutex;
+  
+  {
+    std::lock_guard<std::mutex> lock(output_mutex);
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_output_time).count();
+    
+    if (elapsed >= 1) {  // 至少间隔100毫秒（0.1秒）
+      size_t total_free_memory = 0;
+      for (size_t i = 0; i < free_list_.size(); ++i) {
+        std::lock_guard<std::mutex> g(free_list_[i].mutex_);
+        for (auto* block : free_list_[i].list_) {
+          total_free_memory += block->size_;
+        }
+      }
+      
+      std::cout << "[BuddySystem] Free list total free memory: " 
+                << total_free_memory << " bytes (" 
+                << (total_free_memory / (1024.0 * 1024.0 * 1024.0)) 
+                << " GB) before free operation" << std::endl;
+      
+      last_output_time = now;
+    }
+  }
+*/
     if (!ctx) {
       return;
     }
@@ -314,7 +253,6 @@ struct CachingHostAllocatorImpl {
     auto* block = reinterpret_cast<B*>(ctx);
 
     std::optional<std::vector<E>> events;
-    ska::flat_hash_set<S> streams;
     {
       std::lock_guard<std::mutex> g(block->mutex_);
       block->allocated_ = false;
@@ -323,23 +261,21 @@ struct CachingHostAllocatorImpl {
       } else {
         events = std::vector<E>();
         events->reserve(block->streams_.size());
-        block->event_count_ += block->streams_.size();
-        // Move out streams to avoid holding the mutex during event recording
-        streams = std::move(block->streams_);
+        for (auto stream : block->streams_) {
+          record_stream(events, stream);
+        }
+        block->event_count_ += events->size();
         block->streams_.clear();
       }
     }
 
-    // Event recording must be done outside the mutex to avoid potential
-    // deadlocks (e.g., when Python GIL is involved)
-    for (auto stream : streams) {
-      record_stream(events, stream);
-    }
-
     if (!events) {
+      /*
       auto index = size_index(block->size_);
       std::lock_guard<std::mutex> g(free_list_[index].mutex_);
       free_list_[index].list_.push_back(block);
+      */
+      try_merge_with_buddies(block);
     } else {
       // restore these events that record by used streams.
       std::lock_guard<std::mutex> g(events_mutex_);
@@ -349,8 +285,7 @@ struct CachingHostAllocatorImpl {
     }
   }
 
-  virtual bool record_event(void* ptr, void* ctx, c10::Stream s) {
-    S stream = S(s);
+  virtual bool record_event(void* ptr, void* ctx, S stream) {
     auto* block = reinterpret_cast<B*>(ctx);
 
     // Note: we need to check if the passed-in `ctx` is valid. This is because
@@ -381,32 +316,124 @@ struct CachingHostAllocatorImpl {
   }
 
   virtual void empty_cache() {
-    // Flush any available blocks into the free_list.
+    // 处理所有pending事件
     process_events();
 
-    // Remove all elements from the free list, remove them from the blocks
-    // list, and free the associated pinned memory allocation. This requires
-    // concurrently holding both the free list mutexes and the blocks mutex, and
-    // is the only function that concurrently holds multiple mutexes.
+    // 按原始块分组收集空闲块
+    ska::flat_hash_map<void*, std::vector<B*>> original_blocks_map;
+    std::vector<B*> regular_blocks;  // 非预分配块
+    
+    // 第一阶段：收集所有空闲块并分类
+    {
+        std::lock_guard<std::mutex> gb(blocks_mutex_);
+        
+        for (auto* block : blocks_) {
+            std::lock_guard<std::mutex> g_block(block->mutex_);
+            
+            if (!block->allocated_ && block->event_count_ == 0) {
+                // 根据是否属于预分配块分类
+                if (block->original_ptr_ != nullptr && 
+                    block->original_ptr_ == block->ptr_) {
+                    // 这是原始预分配块
+                    original_blocks_map[block->ptr_].push_back(block);
+                } else if (block->original_ptr_ != nullptr) {
+                    // 这是切分块，按原始指针分组
+                    original_blocks_map[block->original_ptr_].push_back(block);
+                } else {
+                    // 这是独立分配的非预分配块
+                    regular_blocks.push_back(block);
+                }
+            }
+        }
+    }
+    
+    // 第二阶段：清空所有free_list
     for (size_t i = 0; i < free_list_.size(); ++i) {
-      std::lock(free_list_[i].mutex_, blocks_mutex_);
-      std::lock_guard<std::mutex> gf(free_list_[i].mutex_, std::adopt_lock);
-      std::lock_guard<std::mutex> gb(blocks_mutex_, std::adopt_lock);
-
-      std::vector<B*> blocks_to_remove(free_list_[i].list_.begin(), free_list_[i].list_.end());
-      free_list_[i].list_.clear();
-
-      for (auto* block : blocks_to_remove) {
-        blocks_.erase(block);
-        ptr_to_block_.erase(block->ptr_);
-        auto index = size_index(block->size_);
+        std::lock_guard<std::mutex> g(free_list_[i].mutex_);
+        free_list_[i].list_.clear();
+    }
+    
+    // 第三阶段：安全释放内存
+    // 3.1 先释放独立分配的非预分配块
+    for (auto* block : regular_blocks) {
+        {
+            std::lock_guard<std::mutex> gb(blocks_mutex_);
+            blocks_.erase(block);
+            ptr_to_block_.erase(block->ptr_);
+        }
         free_block(block);
-        stats_.allocations.decrease(1);
-        stats_.allocated_bytes.decrease(block->size_);
-        stats_.allocation_bucket_stats[index].decrease(1);
-        stats_.allocated_bytes_bucket_stats[index].decrease(block->size_);
         delete block;
-      }
+    }
+    
+    // 3.2 处理预分配块（按原始块分组）
+    for (auto& [original_ptr, block_group] : original_blocks_map) {
+        // 检查这个原始块是否完全空闲
+        bool can_free_entire_block = true;
+        size_t total_free_size = 0;
+        B* original_block = nullptr;
+        
+        for (auto* block : block_group) {
+            total_free_size += block->size_;
+            
+            // 找到原始块（ptr == original_ptr）
+            if (block->ptr_ == original_ptr) {
+                original_block = block;
+            }
+            
+            // 检查是否有任何部分还在使用
+            if (block->allocated_ || block->event_count_ > 0) {
+                can_free_entire_block = false;
+            }
+        }
+        
+        if (can_free_entire_block && original_block && 
+            total_free_size == original_block->original_size_) {
+            // 情况1：整个原始块完全空闲且未切分或已完全合并
+            {
+                std::lock_guard<std::mutex> gb(blocks_mutex_);
+                // 从管理结构中移除所有相关块
+                for (auto* block : block_group) {
+                    blocks_.erase(block);
+                    ptr_to_block_.erase(block->ptr_);
+                }
+            }
+            
+            // 释放原始块的内存
+            free_block(original_block);
+
+            // 记录释放的预分配块数量
+            {
+              std::lock_guard<std::mutex> g(prealloc_mutex_);
+              prealloc_info_.released_count++;  // 记录释放了一个预分配块
+            }
+            
+            // 删除所有块对象（除了original_block，它会在free_block中处理？）
+            // 注意：根据实现，free_block可能不删除block对象
+            for (auto* block : block_group) {
+                if (block != original_block) {
+                    delete block;
+                }
+            }
+            if (original_block) {
+                delete original_block;
+            }
+        } else {
+            // 情况2：原始块部分在使用中
+            // 不能释放，但可以重新放回free_list供后续使用
+            for (auto* block : block_group) {
+                if (!block->allocated_ && block->event_count_ == 0) {
+                    auto index = size_index(block->size_);
+                    std::lock_guard<std::mutex> g(free_list_[index].mutex_);
+                    free_list_[index].list_.push_back(block);
+                }
+            }
+        }
+    }
+    
+    // 第四阶段：清理事件队列
+    {
+        std::lock_guard<std::mutex> g(events_mutex_);
+        events_.clear();
     }
   }
 
@@ -415,154 +442,338 @@ struct CachingHostAllocatorImpl {
   }
 
   virtual bool pinned_use_background_threads() {
-    return c10::CachingAllocator::AcceleratorAllocatorConfig::
-        pinned_use_background_threads();
+    return false;
   }
 
   virtual void copy_data(void* dest [[maybe_unused]], const void* src [[maybe_unused]], std::size_t count [[maybe_unused]]) const {
     TORCH_CHECK_NOT_IMPLEMENTED(false, "Not implemented for copy_data");
   }
 
-  HostStats getStats() {
-    HostStats stats;
-
-    // To keep getStats lightweight we do *not* flush any available blocks
-    // into the free_list. This may skew the stats a bit.
-
-    auto add_bucket_stats = [](Stat& accumulator, const Stat& other) {
-      accumulator.allocated += other.allocated;
-      accumulator.current += other.current;
-      accumulator.freed += other.freed;
-      // Since peaks are measured per bucket independently, we add them up
-      // to estimate the total peak. This is not strictly correct, but it is
-      // the best approximation we can get after the fact.
-      accumulator.peak += other.peak;
-    };
-
-    // Accurate reading of memory stats requires concurrently holding both the
-    // free list mutexes and the blocks mutex. Previously, this was only done in
-    // empty_cache function.
-    for (size_t i = 0; i < free_list_.size(); ++i) {
-      std::lock(free_list_[i].mutex_, blocks_mutex_);
-      std::lock_guard<std::mutex> gf(free_list_[i].mutex_, std::adopt_lock);
-      std::lock_guard<std::mutex> gb(blocks_mutex_, std::adopt_lock);
-
-      // We collect the slow-path stats only once, since they are not collected
-      // per bucket (we pick index 0 arbitrarily). These are also all the host
-      // allocations, not taking into account caching and free lists.
-      if (i == 0) {
-        stats.allocations = stats_.allocations;
-        stats.allocated_bytes = stats_.allocated_bytes;
-        stats.num_host_alloc = stats.allocations.allocated;
-        stats.num_host_free = stats.allocations.freed;
-      }
-
-      // Bucket stats need to be merged with the slow-path stats. We do this in
-      // a best effort manner, since we can't really replay the cached events per bucket.
-      add_bucket_stats(stats.active_requests, stats_.active_bucket_stats[i]);
-      add_bucket_stats(stats.active_bytes, stats_.active_bytes_bucket_stats[i]);
-      stats.bucket_allocation[i] = stats_.allocation_bucket_stats[i].allocated;
-    }
-
-    // Get the timing stats
-    {
-      std::lock_guard<std::mutex> g(stats_.timing_mutex_);
-
-      stats.host_alloc_time = stats_.host_alloc_time;
-      stats.host_free_time = stats_.host_free_time;
-    }
-
-    return stats;
-  }
-
-  void resetAccumulatedStats() {
-    // Resetting accumulated memory stats requires concurrently holding both the
-    // free list mutexes and the blocks mutex. Previously, this was only done in
-    // empty_cache function.
-    for (size_t i = 0; i < free_list_.size(); ++i) {
-      std::lock(free_list_[i].mutex_, blocks_mutex_);
-      std::lock_guard<std::mutex> gf(free_list_[i].mutex_, std::adopt_lock);
-      std::lock_guard<std::mutex> gb(blocks_mutex_, std::adopt_lock);
-
-      if (i == 0) {
-        stats_.allocations.reset_accumulated();
-        stats_.allocated_bytes.reset_accumulated();
-      }
-      stats_.active_bucket_stats[i].reset_accumulated();
-      stats_.active_bytes_bucket_stats[i].reset_accumulated();
-      stats_.allocation_bucket_stats[i].reset_accumulated();
-      stats_.allocated_bytes_bucket_stats[i].reset_accumulated();
-    }
-
-    // Also reset timing stats
-    {
-      std::lock_guard<std::mutex> g(stats_.timing_mutex_);
-      stats_.host_alloc_time.reset_accumulated();
-      stats_.host_free_time.reset_accumulated();
-    }
-  }
-
-  void resetPeakStats() {
-    // Resetting peak memory stats requires concurrently holding both the
-    // free list mutexes and the blocks mutex. Previously, this was only done in
-    // empty_cache function.
-    for (size_t i = 0; i < free_list_.size(); ++i) {
-      std::lock(free_list_[i].mutex_, blocks_mutex_);
-      std::lock_guard<std::mutex> gf(free_list_[i].mutex_, std::adopt_lock);
-      std::lock_guard<std::mutex> gb(blocks_mutex_, std::adopt_lock);
-
-      if (i == 0) {
-        stats_.allocations.reset_peak();
-        stats_.allocated_bytes.reset_peak();
-      }
-      stats_.active_bucket_stats[i].reset_peak();
-      stats_.active_bytes_bucket_stats[i].reset_peak();
-      stats_.allocation_bucket_stats[i].reset_peak();
-      stats_.allocated_bytes_bucket_stats[i].reset_peak();
-    }
-
-    // Also reset timing stats
-    {
-      std::lock_guard<std::mutex> g(stats_.timing_mutex_);
-      stats_.host_alloc_time.reset_peak();
-      stats_.host_free_time.reset_peak();
-    }
-  }
-
  private:
+
+  virtual void reallocate_prealloc_blocks() {
+    if (prealloc_info_.released_count == 0 || 
+        prealloc_info_.block_size == 0) {
+      return;
+    }
+    
+    std::cout << "[BuddySystem] Reallocating " << prealloc_info_.released_count 
+              << " preallocated blocks of size " 
+              << (prealloc_info_.block_size / (1024*1024)) << " MB" << std::endl;
+    
+    size_t single_block_size = prealloc_info_.block_size;
+    auto single_block_index = size_index(single_block_size);
+    size_t count_to_allocate = prealloc_info_.released_count;
+    
+    for (size_t i = 0; i < count_to_allocate; i++) {
+            try {
+        void* ptr = nullptr;
+        allocate_host_memory(single_block_size, &ptr);
+        auto* block = new B(single_block_size, ptr);
+        block->original_size_ = single_block_size;  
+        block->is_buddy_split_ = false;            
+        add_allocated_block(block);
+        
+        std::lock_guard<std::mutex> g(free_list_[single_block_index].mutex_);
+        free_list_[single_block_index].list_.push_back(block);
+      } catch (const std::exception& e) {
+        std::cerr << "[BuddySystem] WARNING: Failed to reallocate block " 
+                  << (i + 1) << "/" << count_to_allocate 
+                  << ": " << e.what() << std::endl;
+        // 如果申请失败，减少需要重新申请的数量
+        prealloc_info_.released_count--;
+      }
+    }
+    
+    // 更新已释放的计数
+    {
+      prealloc_info_.released_count -= count_to_allocate;
+    }
+  }
+
+  virtual void init_buddy_system() {
+    const char* block_size_env = getenv("BUDDY_BLOCK_SIZE_MB");
+    size_t block_size_mb = 1024;
+    if (block_size_env && *block_size_env != '\0') {
+      try {
+        block_size_mb = std::stoul(block_size_env);
+        std::cout << "[BuddySystem] Using block size from BUDDY_BLOCK_SIZE_MB: " 
+                  << block_size_mb << " MB" << std::endl;
+      } catch (const std::exception& e) {
+        std::cerr << "[BuddySystem] Invalid BUDDY_BLOCK_SIZE_MB value '" 
+                  << block_size_env << "', using default 1024MB. Error: " << e.what() << std::endl;
+        block_size_mb = 1024;
+      }
+    } else {
+      std::cout << "[BuddySystem] BUDDY_BLOCK_SIZE_MB not set, using default 1024MB" << std::endl;
+    }
+
+    const char* block_count_env = getenv("BUDDY_BLOCK_COUNT");
+    size_t block_count = 8;
+    if (block_count_env && *block_count_env != '\0') {
+      try {
+        block_count = std::stoul(block_count_env);
+        std::cout << "[BuddySystem] Using block count from BUDDY_BLOCK_COUNT: " 
+                  << block_count << std::endl;
+      } catch (const std::exception& e) {
+        std::cerr << "[BuddySystem] Invalid BUDDY_BLOCK_COUNT value '" 
+                  << block_count_env << "', using default 8. Error: " << e.what() << std::endl;
+        block_count = 8;
+      }
+    } else {
+      std::cout << "[BuddySystem] BUDDY_BLOCK_COUNT not set, using default 8" << std::endl;
+    }
+
+    const size_t single_block_size = block_size_mb * 1024 * 1024;
+    const size_t total_size = single_block_size * block_count;
+  
+    std::cout << "[BuddySystem] Configuration:" << std::endl;
+    std::cout << "[BuddySystem]   Single block size: " << block_size_mb << " MB (" 
+              << single_block_size << " bytes)" << std::endl;
+    std::cout << "[BuddySystem]   Block count: " << block_count << std::endl;
+    std::cout << "[BuddySystem]   Total preallocated memory: " 
+              << (total_size / (1024.0 * 1024 * 1024)) << " GB (" 
+              << total_size << " bytes)" << std::endl;
+
+    auto single_block_index = size_index(single_block_size);
+    if (single_block_index > MAX_INDEX) {
+      std::cerr << "[BuddySystem] ERROR: Single block size " << block_size_mb 
+                << "MB (" << single_block_size << " bytes) is too large." << std::endl;
+      std::cerr << "[BuddySystem] Calculated index " << single_block_index << " exceeds MAX_INDEX " << MAX_INDEX 
+                << " (max single block size: " << ((1ULL << MAX_INDEX) / (1024*1024)) << " MB)" << std::endl;
+      std::cerr << "[BuddySystem] Please set BUDDY_BLOCK_SIZE_MB to a smaller value." << std::endl;
+      return;
+    }
+
+    std::cout << "[BuddySystem] Starting preallocation of " << block_count << " blocks..." << std::endl;
+  
+    size_t successful_allocations = 0;
+    for (size_t i = 0; i < block_count; i++) {
+      try {
+        void* ptr = nullptr;
+        allocate_host_memory(single_block_size, &ptr);
+        auto* block = new B(single_block_size, ptr);
+        block->original_size_ = single_block_size;  
+        block->is_buddy_split_ = false;            
+        add_allocated_block(block);
+      
+        std::lock_guard<std::mutex> g(free_list_[single_block_index].mutex_);
+        free_list_[single_block_index].list_.push_back(block);
+        successful_allocations++;
+      
+      } catch (const std::exception& e) {
+        std::cerr << "[BuddySystem] WARNING: Failed to allocate block " << (i + 1) 
+                  << "/" << block_count << ": " << e.what() << std::endl;
+      }
+    }
+
+    {
+      std::lock_guard<std::mutex> g(prealloc_mutex_);
+      prealloc_info_.block_count = successful_allocations;
+      prealloc_info_.block_size = single_block_size;
+      prealloc_info_.released_count = 0;  // 初始时没有释放
+    }
+
+    std::cout << "[BuddySystem] Preallocation completed: " << successful_allocations 
+              << "/" << block_count << " blocks allocated successfully" << std::endl;
+    std::cout << "[BuddySystem] Total preallocated memory: " 
+              << (successful_allocations * single_block_size / (1024.0 * 1024 * 1024)) 
+              << " GB" << std::endl;
+    std::cout << "[BuddySystem] Ready to serve allocations from preallocated memory pool" << std::endl;
+  }
+
   virtual void add_allocated_block(B* block) {
     std::lock_guard<std::mutex> g(blocks_mutex_);
     blocks_.insert(block);
-    stats_.allocations.increase(1);
-    stats_.allocated_bytes.increase(block->size_);
     ptr_to_block_.insert({block->ptr_, block});
-
-    // Unfortunately, we have to, on the slow path, quickly
-    // lock the bucket to record the allocation. This should
-    // be a rare event once the cache is warmed up.
-    auto size = block->size_;
-    auto index = size_index(size);
-    {
-      std::lock_guard<std::mutex> g(free_list_[index].mutex_);
-      stats_.allocation_bucket_stats[index].increase(1);
-      stats_.allocated_bytes_bucket_stats[index].increase(size);
-      stats_.active_bucket_stats[index].increase(1);
-      stats_.active_bytes_bucket_stats[index].increase(size);
-    }
   }
 
+  /*
   virtual B* get_free_block(size_t size) {
     auto index = size_index(size);
     std::lock_guard<std::mutex> g(free_list_[index].mutex_);
-    if (!free_list_[index].list_.empty()) {
+    if (free_list_[index].list_.size() > 0) {
       B* block = free_list_[index].list_.back();
       free_list_[index].list_.pop_back();
       block->allocated_ = true;
-      stats_.active_bucket_stats[index].increase(1);
-      stats_.active_bytes_bucket_stats[index].increase(size);
       return block;
     }
     return nullptr;
+  }
+  */
+  
+  virtual B* get_free_block(size_t size) {
+    static size_t buddy_threshold = []() {
+      const char* threshold_env = getenv("BUDDY_THRESHOLD_MB");
+      size_t threshold = 4; // Default 4MB
+      if (threshold_env && *threshold_env != '\0') {
+        try {
+          threshold = std::stoul(threshold_env);
+          std::cout << "[BuddySystem] Using threshold from BUDDY_THRESHOLD_MB: " 
+                    << threshold << " MB" << std::endl;
+        } catch (const std::exception& e) {
+          std::cerr << "[BuddySystem] Invalid BUDDY_THRESHOLD_MB value '" 
+                    << threshold_env << "', using default 4MB. Error: " << e.what() << std::endl;
+          threshold = 4;
+        }
+      } else {
+        std::cout << "[BuddySystem] BUDDY_THRESHOLD_MB not set, using default 4MB" << std::endl;
+      }
+      return threshold * 1024 * 1024;
+    }();
+  
+    auto start_index = size_index(size);
+
+    if (size <= buddy_threshold) {
+      std::lock_guard<std::mutex> g(free_list_[start_index].mutex_);
+      if (free_list_[start_index].list_.size() > 0) {
+        B* block = free_list_[start_index].list_.back();
+        free_list_[start_index].list_.pop_back();
+        {
+          std::lock_guard<std::mutex> block_g(block->mutex_);
+          block->allocated_ = true;
+        }
+        return block;
+      }
+      return nullptr;
+    }
+    
+    for (int index = start_index; index <= MAX_INDEX; index++) {
+        std::lock_guard<std::mutex> g(free_list_[index].mutex_);
+        if (free_list_[index].list_.size() > 0) {
+            B* block = free_list_[index].list_.back();
+            free_list_[index].list_.pop_back();
+            if (index > start_index) {
+                split_block(block, start_index, index);
+            }
+            if (!is_block_allocated(block)) {
+                add_allocated_block(block);
+            }
+            {
+                std::lock_guard<std::mutex> block_g(block->mutex_);
+                block->allocated_ = true;
+            }
+            return block;
+        }
+    }
+    return nullptr;
+  }
+
+  void split_block(B* block, size_t target_index, size_t current_index) {
+    if (current_index <= target_index) {
+      return;
+    }
+    size_t current_size = block->size_;
+    size_t half_size = current_size / 2;
+    void* buddy_ptr = static_cast<char*>(block->ptr_) + half_size;
+    B* buddy_block = new B(half_size, buddy_ptr);
+    buddy_block->original_ptr_ = block->original_ptr_;  // 继承原始指针
+    buddy_block->original_size_ = block->original_size_; // 继承原始大小
+    buddy_block->is_buddy_split_ = true;                // 标记为切分块
+    block->is_buddy_split_ = true;                      // 原块也标记为切分块
+    add_allocated_block(buddy_block);
+    block->size_ = half_size;
+    auto buddy_index = current_index - 1;
+    {
+      std::lock_guard<std::mutex> g(free_list_[buddy_index].mutex_);
+      free_list_[buddy_index].list_.push_back(buddy_block);
+    }
+    if (current_index - 1 > target_index) {
+      split_block(block, target_index, current_index - 1);
+    }
+  }
+
+  void try_merge_with_buddies(B* block) {
+    size_t index = size_index(block->size_);
+    while (index < MAX_INDEX) {
+        void* buddy_addr = get_buddy_address(block->ptr_, block->size_);
+        bool merged = false;
+        {
+            std::lock_guard<std::mutex> g(free_list_[index].mutex_);
+            auto& list = free_list_[index].list_;
+  
+            auto it = std::find_if(list.begin(), list.end(), 
+                [buddy_addr, block](B* b) { 
+                    return b->ptr_ == buddy_addr && b->size_ == block->size_ && b->original_ptr_ == block->original_ptr_; 
+                });
+            
+            if (it != list.end()) {
+                B* buddy = *it;
+                list.erase(it);
+                void* merged_addr = (block->ptr_ < buddy_addr) ? block->ptr_ : buddy_addr;
+                block->ptr_ = merged_addr;
+                block->size_ *= 2;
+                if (block->size_ == block->original_size_) {
+                    block->is_buddy_split_ = false;
+                }
+                {
+                    std::lock_guard<std::mutex> blocks_g(blocks_mutex_);
+                    blocks_.erase(buddy);
+                    ptr_to_block_.erase(buddy->ptr_);
+                }
+                delete buddy;
+                merged = true;
+                index++;
+            }
+        }
+        if (!merged) {
+            break;
+        }
+    }
+    auto final_index = size_index(block->size_);
+    {
+        std::lock_guard<std::mutex> g(free_list_[final_index].mutex_);
+        free_list_[final_index].list_.push_back(block);
+    }
+  }
+
+  // 判断是否为完整的原始预分配块
+    bool is_complete_original_block(B* block) {
+        if (!block) return false;
+        std::lock_guard<std::mutex> g(block->mutex_);
+        return (block->ptr_ == block->original_ptr_) &&
+               (block->size_ == block->original_size_) &&
+               !block->is_buddy_split_;
+    }
+
+    // 判断块是否可以安全释放
+    bool can_safely_free_block(B* block) {
+        if (!block) return false;
+
+        std::lock_guard<std::mutex> g(block->mutex_);
+
+        // 检查是否在使用中
+        if (block->allocated_ || block->event_count_ > 0) {
+            return false;
+        }
+
+        // 独立分配的块可以直接释放
+        if (block->original_ptr_ == nullptr) {
+            return true;
+        }
+
+        // 预分配块的切分块不能单独释放
+        if (block->is_buddy_split_) {
+            return false;
+        }
+
+        // 完整的原始预分配块可以释放
+        if (block->ptr_ == block->original_ptr_ &&
+            block->size_ == block->original_size_) {
+            return true;
+        }
+
+        return false;
+    }
+
+  void* get_buddy_address(void* addr, size_t size) {
+      uintptr_t addr_val = reinterpret_cast<uintptr_t>(addr);
+      return reinterpret_cast<void*>(addr_val ^ size);
+  }
+
+    bool is_block_allocated(B* block) {
+    std::lock_guard<std::mutex> g(blocks_mutex_);
+    return blocks_.find(block) != blocks_.end();
   }
 
   virtual void process_events() {
@@ -653,8 +864,6 @@ struct CachingHostAllocatorImpl {
         auto index = size_index(block->size_);
         std::lock_guard<std::mutex> g(free_list_[index].mutex_);
         free_list_[index].list_.push_back(block);
-        stats_.active_bucket_stats[index].decrease(1);
-        stats_.active_bytes_bucket_stats[index].decrease(size);
         if (size != -1) {
           return;
         }
@@ -667,100 +876,61 @@ struct CachingHostAllocatorImpl {
     return pool;
   }
 
-  /* These following functions are runtime-related. */
+    /* These following functions are runtime-related. */
 
-  // Allocate page-locked memory on the host.
-  virtual void allocate_host_memory(size_t size, void** ptr) {
-    TORCH_CHECK_NOT_IMPLEMENTED(
-        false, "Not implemented for allocate_host_memory");
-  }
+    // Allocate page-locked memory on the host.
+    virtual void allocate_host_memory(size_t size, void** ptr) {
+      TORCH_CHECK_NOT_IMPLEMENTED(
+          false, "Not implemented for allocate_host_memory");
+    }
 
-  // Free block and release the pointer contained in block.
-  virtual void free_block(B* block) {
-    TORCH_CHECK_NOT_IMPLEMENTED(false, "Not implemented for free_block");
-  }
+    // Free block and release the pointer contained in block.
+    virtual void free_block(B* block) {
+      TORCH_CHECK_NOT_IMPLEMENTED(false, "Not implemented for free_block");
+    }
 
-  // Record an event on stream and store event into events.
-  virtual void record_stream(std::optional<std::vector<E>>& events, S stream) {
-    TORCH_CHECK_NOT_IMPLEMENTED(false, "Not implemented for record_stream");
-  }
+    // Record an event on stream and store event into events.
+    virtual void record_stream(std::optional<std::vector<E>>& events, S stream) {
+      TORCH_CHECK_NOT_IMPLEMENTED(false, "Not implemented for record_stream");
+    }
 
-  // Query event if it is completed.
-  virtual bool query_event(E& event) {
-    TORCH_CHECK_NOT_IMPLEMENTED(false, "Not implemented for query_event");
-  }
+    // Query event if it is completed.
+    virtual bool query_event(E& event) {
+      TORCH_CHECK_NOT_IMPLEMENTED(false, "Not implemented for query_event");
+    }
 
-  alignas(hardware_destructive_interference_size) std::mutex blocks_mutex_;
-  ska::flat_hash_set<B*> blocks_; // block list
-  ska::flat_hash_map<void*, B*> ptr_to_block_;
+    alignas(64) std::mutex blocks_mutex_;
+    ska::flat_hash_set<B*> blocks_; // block list
+    ska::flat_hash_map<void*, B*> ptr_to_block_;
 
-  // We keep free list as a vector of free lists, one for each power of two
-  // size. This allows us to quickly find a free block of the right size.
-  // We use deque to store per size free list and guard the list with its own
-  // mutex.
-  alignas(hardware_destructive_interference_size) std::vector<FreeBlockList<B>>
-      free_list_{MAX_SIZE_INDEX};
+    // We keep free list as a vector of free lists, one for each power of two
+    // size. This allows us to quickly find a free block of the right size.
+    // We use deque to store per size free list and guard the list with its own
+    // mutex.
+    alignas(64) std::vector<FreeBlockList<B>> free_list_ = std::vector<FreeBlockList<B>>(MAX_SIZE_INDEX);
 
-  alignas(hardware_destructive_interference_size) std::mutex events_mutex_;
-  std::deque<std::pair<E, B*>> events_; // event queue paired with block
+    alignas(64) std::mutex events_mutex_;
+    std::deque<std::pair<E, B*>> events_; // event queue paired with block
+  };
 
-  // Indicates whether the object is active.
-  // Set to false in the destructor to signal background threads to stop.
-  std::atomic<bool> active_{true};
-protected:
-  alignas(hardware_destructive_interference_size) HostStatsStaged stats_;
-};
-
-struct TORCH_API HostAllocator : public at::Allocator {
-  // Associates the pinned memory allocation with a stream to track
-  // dependencies. This ensures the memory won't be reused until the stream's
-  // operations complete
-  virtual bool record_event(void* ptr, void* ctx, c10::Stream stream) = 0;
-
-  // Frees all cached pinned memory and returns it to the system, clearing the
-  // allocator's internal cache
-  virtual void empty_cache() = 0;
-
-  // Returns comprehensive statistics about the allocator's memory usage,
-  // allocation patterns, and timing metrics
-  virtual HostStats get_stats() = 0;
-
-  // Resets the cumulative allocation statistics
-  virtual void reset_accumulated_stats() = 0;
-
-  // Resets the peak memory usage metrics
-  virtual void reset_peak_stats() = 0;
-};
-
-template <typename T, c10::DeleterFnPtr deleteFunc>
-struct CachingHostAllocatorInterface : public HostAllocator {
+template <typename T>
+struct CachingHostAllocatorInterface : public at::Allocator {
   CachingHostAllocatorInterface() : impl_(std::make_unique<T>()) {}
 
   at::DataPtr allocate(size_t size) override {
-    auto ptr_and_ctx = impl_->allocate(size);
-    return {
-        ptr_and_ctx.first,
-        ptr_and_ctx.second,
-        deleteFunc, // Use the template parameter deleter function
-        at::DeviceType::CPU};
+    TORCH_CHECK_NOT_IMPLEMENTED(false, "Not implemented for allocate");
   }
-
-  // ==============newly added==============
-  // warm-up interface
-  void warmup_cache(const std::vector<size_t>& common_sizes, 
-                     size_t copies_per_size) {
-        impl_->warmup_cache(common_sizes, copies_per_size);
-    }
 
   void free(void* ctx) {
     impl_->free(ctx);
   }
 
-  bool record_event(void* ptr, void* ctx, c10::Stream stream) override {
+  template <typename S>
+  bool record_event(void* ptr, void* ctx, S stream) {
     return impl_->record_event(ptr, ctx, stream);
   }
 
-  void empty_cache() override {
+  void empty_cache() {
     impl_->empty_cache();
   }
 
@@ -769,54 +939,8 @@ struct CachingHostAllocatorInterface : public HostAllocator {
     impl_->copy_data(dest, src, count);
   }
 
-  HostStats get_stats() override {
-    return impl_->getStats();
-  }
-
-  void reset_accumulated_stats() override {
-    impl_->resetAccumulatedStats();
-  }
-
-  void reset_peak_stats() override {
-    impl_->resetPeakStats();
-  }
-
   std::unique_ptr<T> impl_;
 };
-
-#define DECLARE_HOST_ALLOCATOR(name, impl, deleter, instance)       \
-  void deleter(void* ptr);                                          \
-  struct name final                                                 \
-      : public at::CachingHostAllocatorInterface<impl, deleter> {}; \
-  static name instance;                                                    \
-  void deleter(void* ptr) {                                         \
-    instance.free(ptr);                                             \
-  }
-
-/**
- * Set the host allocator for DeviceType `device_type`. This allocator manages
- * pinned memory on the host that can be accessed efficiently by the specified
- * device type. Note that this function is not thread-safe.
- */
-TORCH_API void setHostAllocator(
-    at::DeviceType device_type,
-    at::HostAllocator* allocator,
-    uint8_t priority = 0);
-
-TORCH_API at::HostAllocator* getHostAllocator(at::DeviceType device_type);
-
-template <DeviceType device_type>
-struct HostAllocatorRegistry {
-  explicit HostAllocatorRegistry(HostAllocator* allocator) {
-    at::setHostAllocator(device_type, allocator);
-  }
-};
-
-#define REGISTER_HOST_ALLOCATOR(device_type, allocator) \
-  namespace {                                           \
-  static at::HostAllocatorRegistry<device_type>         \
-      g_host_allocator_registry_instance(allocator);    \
-  }
 
 } // namespace at
 C10_DIAGNOSTIC_POP()
